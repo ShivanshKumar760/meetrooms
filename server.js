@@ -130,6 +130,179 @@
 
 
 
+// import express from 'express';
+// import http from 'node:http';
+// import path from 'node:path';
+// import crypto from 'node:crypto';
+// import { fileURLToPath } from 'node:url';
+// import { WebSocketServer } from 'ws';
+
+// const app = express();
+// const server = http.createServer(app);
+// const __filename = fileURLToPath(import.meta.url);
+// const __dirname = path.dirname(__filename);
+
+// const wss = new WebSocketServer({ server });
+
+// app.use(express.static(path.join(__dirname, 'public')));
+
+// const rooms = new Map();
+// const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+// function generateRoomCode(length = 5) {
+//   let code = '';
+//   for (let i = 0; i < length; i++) {
+//     code += ROOM_CODE_ALPHABET[crypto.randomInt(ROOM_CODE_ALPHABET.length)];
+//   }
+//   return code;
+// }
+
+// // Make sure a new code never collides with an existing room.
+// function generateUniqueRoomCode() {
+//   let code;
+//   do {
+//     code = generateRoomCode();
+//   } while (rooms.has(code));
+//   return code;
+// }
+
+// // FIX: the original condition was `!ws.readyState === ws.OPEN`, which is
+// // always false, so nothing was ever sent.
+// function send(ws, data) {
+//   if (ws.readyState === ws.OPEN) {
+//     ws.send(JSON.stringify(data));
+//   }
+// }
+
+// function relayToPeer(ws, data) {
+//   const room = rooms.get(ws.roomId);
+//   if (!room) return;
+//   for (const peer of room) {
+//     if (peer !== ws) {
+//       send(peer, data);
+//     }
+//   }
+// }
+
+// // Remove a socket from its room and tell the remaining peer.
+// function leaveRoom(ws) {
+//   const roomId = ws.roomId;
+//   if (!roomId) return;
+
+//   const room = rooms.get(roomId);
+//   if (room) {
+//     room.delete(ws);
+//     for (const peer of room) {
+//       send(peer, { type: 'peer_left' });
+//     }
+//     if (room.size === 0) {
+//       rooms.delete(roomId);
+//     }
+//   }
+//   ws.roomId = null;
+// }
+
+// app.get('/health', (req, res) => {
+//   res.json({ status: 'ok', rooms: rooms.size });
+// });
+
+// wss.on('connection', (ws) => {
+//   ws.roomId = null;
+//   ws.isAlive = true;
+//   ws.on('pong', () => {
+//     ws.isAlive = true;
+//   });
+
+//   ws.on('message', (raw) => {
+//     let msg;
+//     try {
+//       msg = JSON.parse(raw.toString());
+//     } catch (err) {
+//       return;
+//     }
+//     if (!msg || typeof msg !== 'object') return;
+
+//     switch (msg.type) {
+//       case 'create_room': {
+//         // FIX: prevent being in multiple rooms at once.
+//         if (ws.roomId) {
+//           send(ws, { type: 'error', message: 'Already in a room' });
+//           return;
+//         }
+//         const roomId = generateUniqueRoomCode();
+//         rooms.set(roomId, new Set([ws]));
+//         ws.roomId = roomId;
+//         send(ws, { type: 'room_created', roomId });
+//         break;
+//       }
+
+//       case 'join_room': {
+//         if (ws.roomId) {
+//           send(ws, { type: 'error', message: 'Already in a room' });
+//           return;
+//         }
+//         const roomId = String(msg.roomId || '').toUpperCase().trim();
+//         const room = rooms.get(roomId);
+
+//         if (!room) {
+//           send(ws, { type: 'error', message: 'Room not found' });
+//           return;
+//         }
+//         if (room.size >= 2) {
+//           send(ws, { type: 'error', message: 'Room is full' });
+//           return;
+//         }
+
+//         room.add(ws);
+//         ws.roomId = roomId;
+//         send(ws, { type: 'joined', roomId });
+//         relayToPeer(ws, { type: 'peer_joined' });
+//         break;
+//       }
+
+//       case 'chat': {
+//         if (!ws.roomId) return;
+//         if (typeof msg.text !== 'string' || !msg.text.trim()) return;
+//         relayToPeer(ws, { type: 'chat', text: msg.text.trim().slice(0, 1000) });
+//         break;
+//       }
+
+//       // WebRTC signaling: the server never looks inside `msg.data`.
+//       // It just relays SDP offers/answers and ICE candidates unmodified.
+//       case 'signal': {
+//         if (!ws.roomId) return;
+//         relayToPeer(ws, { type: 'signal', data: msg.data });
+//         break;
+//       }
+
+//       default:
+//         break;
+//     }
+//   });
+
+//   ws.on('close', () => leaveRoom(ws));
+//   ws.on('error', () => leaveRoom(ws));
+// });
+
+// // Drop dead connections (e.g. a laptop lid closed) so rooms don't stay "full".
+// const heartbeat = setInterval(() => {
+//   for (const ws of wss.clients) {
+//     if (!ws.isAlive) {
+//       ws.terminate();
+//       continue;
+//     }
+//     ws.isAlive = false;
+//     ws.ping();
+//   }
+// }, 30000);
+// wss.on('close', () => clearInterval(heartbeat));
+
+// const PORT = process.env.PORT || 3000;
+// server.listen(PORT, () => {
+//   console.log(`Chat + video server listening on port ${PORT}`);
+// });
+
+
 import express from 'express';
 import http from 'node:http';
 import path from 'node:path';
@@ -204,6 +377,73 @@ function leaveRoom(ws) {
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', rooms: rooms.size });
+});
+
+// ---------------------------------------------------------------
+// Cloudflare Realtime TURN
+// ---------------------------------------------------------------
+// The browser asks /ice-config for its STUN/TURN server list. We call
+// Cloudflare with the secret API token (kept in env vars, never sent to the
+// browser) to mint short-lived TURN credentials, and pass the result on.
+// If anything is missing or Cloudflare is unreachable we fall back to plain
+// STUN, so the app still works on friendly networks.
+const CREDENTIAL_TTL_SECONDS = 86400;            // credentials valid for 24h
+const CACHE_MS = 6 * 60 * 60 * 1000;             // reuse them for 6h (always >=18h left)
+const FALLBACK_ICE = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+let cachedIce = null;      // { iceServers, expiresAt }
+let inflight = null;       // avoids several simultaneous Cloudflare calls
+
+async function fetchCloudflareIceServers() {
+  const { CLOUDFLARE_TURN_KEY_ID, CLOUDFLARE_TURN_API_TOKEN } = process.env;
+  if (!CLOUDFLARE_TURN_KEY_ID || !CLOUDFLARE_TURN_API_TOKEN) {
+    throw new Error('CLOUDFLARE_TURN_KEY_ID / CLOUDFLARE_TURN_API_TOKEN not set');
+  }
+
+  const r = await fetch(
+    `https://rtc.live.cloudflare.com/v1/turn/keys/${CLOUDFLARE_TURN_KEY_ID}/credentials/generate-ice-servers`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${CLOUDFLARE_TURN_API_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ ttl: CREDENTIAL_TTL_SECONDS }),
+    }
+  );
+  if (!r.ok) throw new Error('Cloudflare returned ' + r.status);
+
+  const data = await r.json();
+  if (!Array.isArray(data.iceServers) || data.iceServers.length === 0) {
+    throw new Error('Cloudflare response had no iceServers');
+  }
+  return data.iceServers;
+}
+
+async function getIceServers() {
+  if (cachedIce && cachedIce.expiresAt > Date.now()) return cachedIce.iceServers;
+
+  if (!inflight) {
+    inflight = fetchCloudflareIceServers()
+      .then((iceServers) => {
+        cachedIce = { iceServers, expiresAt: Date.now() + CACHE_MS };
+        return iceServers;
+      })
+      .finally(() => {
+        inflight = null;
+      });
+  }
+  return inflight;
+}
+
+app.get('/ice-config', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    res.json({ iceServers: await getIceServers() });
+  } catch (err) {
+    console.error('ICE config error:', err.message);
+    res.json({ iceServers: FALLBACK_ICE });
+  }
 });
 
 wss.on('connection', (ws) => {
